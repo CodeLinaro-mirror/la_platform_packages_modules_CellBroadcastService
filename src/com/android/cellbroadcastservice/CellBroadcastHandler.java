@@ -38,7 +38,6 @@ import android.location.Location;
 import android.location.LocationManager;
 import android.location.LocationRequest;
 import android.net.Uri;
-import android.os.CancellationSignal;
 import android.os.Handler;
 import android.os.HandlerExecutor;
 import android.os.Looper;
@@ -65,7 +64,6 @@ import java.io.FileDescriptor;
 import java.io.PrintWriter;
 import java.text.DateFormat;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -144,7 +142,7 @@ public class CellBroadcastHandler extends WakeLockStateMachine {
     };
 
     private CellBroadcastHandler(Context context) {
-        this("CellBroadcastHandler", context, Looper.myLooper());
+        this(CellBroadcastHandler.class.getSimpleName(), context, Looper.myLooper());
     }
 
     @VisibleForTesting
@@ -262,6 +260,21 @@ public class CellBroadcastHandler extends WakeLockStateMachine {
     }
 
     /**
+     * Get the maximum time for waiting location.
+     *
+     * @param message Cell broadcast message
+     * @return The maximum waiting time in second
+     */
+    protected int getMaxLocationWaitingTime(SmsCbMessage message) {
+        int maximumTime = message.getMaximumWaitingDuration();
+        if (maximumTime == SmsCbMessage.MAXIMUM_WAIT_TIME_NOT_SET) {
+            Resources res = getResources(message.getSubscriptionId());
+            maximumTime = res.getInteger(R.integer.max_location_waiting_time);
+        }
+        return maximumTime;
+    }
+
+    /**
      * Dispatch a Cell Broadcast message to listeners.
      * @param message the Cell Broadcast to broadcast
      */
@@ -286,7 +299,7 @@ public class CellBroadcastHandler extends WakeLockStateMachine {
                 } else {
                     performGeoFencing(message, uri, message.getGeometries(), location, slotIndex);
                 }
-            }, message.getMaximumWaitingDuration());
+            }, getMaxLocationWaitingTime(message));
         } else {
             if (DBG) {
                 log("Broadcast the message directly because no geo-fencing required, "
@@ -314,16 +327,7 @@ public class CellBroadcastHandler extends WakeLockStateMachine {
         // and is not broadcasted.
         String where = CellBroadcasts.RECEIVED_TIME + ">?";
 
-        int slotIndex = message.getSlotIndex();
-        SubscriptionManager subMgr = (SubscriptionManager) mContext.getSystemService(
-                Context.TELEPHONY_SUBSCRIPTION_SERVICE);
-        int[] subIds = subMgr.getSubscriptionIds(slotIndex);
-        Resources res;
-        if (subIds != null) {
-            res = getResources(subIds[0]);
-        } else {
-            res = getResources(SubscriptionManager.DEFAULT_SUBSCRIPTION_ID);
-        }
+        Resources res = getResources(message.getSubscriptionId());
 
         // Only consider cell broadcast messages received within certain period.
         // By default it's 24 hours.
@@ -352,6 +356,7 @@ public class CellBroadcastHandler extends WakeLockStateMachine {
         }
 
         boolean compareMessageBody = res.getBoolean(R.bool.duplicate_compare_body);
+        boolean compareCellLocation = res.getBoolean(R.bool.duplicate_compare_cell_location);
 
         log("Found " + cbMessages.size() + " messages since "
                 + DateFormat.getDateTimeInstance().format(dupCheckTime));
@@ -386,6 +391,13 @@ public class CellBroadcastHandler extends WakeLockStateMachine {
                         && !Objects.equals(mServiceCategoryCrossRATMap.get(
                                 messageToCheck.getServiceCategory()),
                         message.getServiceCategory())) {
+                    // Not a dup. Check next one.
+                    continue;
+                }
+
+                // For some carriers, comparing cell location is required.
+                if (compareCellLocation && (!message.getLocation().equals(
+                        messageToCheck.getLocation()))) {
                     // Not a dup. Check next one.
                     continue;
                 }
@@ -597,36 +609,27 @@ public class CellBroadcastHandler extends WakeLockStateMachine {
     }
 
     private static final class LocationRequester {
-        private static final String TAG = LocationRequester.class.getSimpleName();
+        private static final String TAG = CellBroadcastHandler.class.getSimpleName();
 
         /**
-         * Use as the default maximum wait time if the cell broadcast doesn't specify the value.
-         * Most of the location request should be responded within 30 seconds.
+         * Fused location provider, which means GPS plus network based providers (cell, wifi, etc..)
          */
-        private static final int DEFAULT_MAXIMUM_WAIT_TIME_SEC = 30;
-
-        /**
-         * Request location update from network or gps location provider. Network provider will be
-         * used if available, otherwise use the gps provider.
-         */
-        private static final List<String> LOCATION_PROVIDERS = Arrays.asList(
-                LocationManager.NETWORK_PROVIDER, LocationManager.GPS_PROVIDER);
+        //TODO: Should make LocationManager.FUSED_PROVIDER system API in S.
+        private static final String FUSED_PROVIDER = "fused";
 
         private final LocationManager mLocationManager;
         private final List<LocationUpdateCallback> mCallbacks;
         private final Context mContext;
         private final Handler mLocationHandler;
 
-        private int mNumLocationUpdatesInProgress;
-
-        private final List<CancellationSignal> mCancellationSignals = new ArrayList<>();
+        private boolean mLocationUpdateInProgress;
 
         LocationRequester(Context context, LocationManager locationManager, Handler handler) {
             mLocationManager = locationManager;
             mCallbacks = new ArrayList<>();
             mContext = context;
             mLocationHandler = handler;
-            mNumLocationUpdatesInProgress = 0;
+            mLocationUpdateInProgress = false;
         }
 
         /**
@@ -644,29 +647,19 @@ public class CellBroadcastHandler extends WakeLockStateMachine {
         }
 
         private void onLocationUpdate(@Nullable Location location) {
-            mNumLocationUpdatesInProgress--;
-
+            mLocationUpdateInProgress = false;
             LatLng latLng = null;
             if (location != null) {
                 Log.d(TAG, "Got location update");
                 latLng = new LatLng(location.getLatitude(), location.getLongitude());
-            } else if (mNumLocationUpdatesInProgress > 0) {
-                Log.d(TAG, "Still waiting for " + mNumLocationUpdatesInProgress
-                        + " more location updates.");
-                return;
             } else {
-                Log.d(TAG, "Location is not available.");
+                Log.e(TAG, "Location is not available.");
             }
 
             for (LocationUpdateCallback callback : mCallbacks) {
                 callback.onLocationUpdate(latLng);
             }
             mCallbacks.clear();
-
-            mCancellationSignals.forEach(CancellationSignal::cancel);
-            mCancellationSignals.clear();
-
-            mNumLocationUpdatesInProgress = 0;
         }
 
         private void requestLocationUpdateInternal(@NonNull LocationUpdateCallback callback,
@@ -679,36 +672,29 @@ public class CellBroadcastHandler extends WakeLockStateMachine {
                 callback.onLocationUpdate(null);
                 return;
             }
-            if (mNumLocationUpdatesInProgress == 0) {
-                for (String provider : LOCATION_PROVIDERS) {
-                    if (!mLocationManager.isProviderEnabled(provider)) {
-                        if (DBG) {
-                            Log.d(TAG, "provider " + provider + " not available");
-                        }
-                        continue;
-                    }
-                    LocationRequest request = LocationRequest.createFromDeprecatedProvider(provider,
-                            0, 0, true);
-                    if (maximumWaitTimeS == SmsCbMessage.MAXIMUM_WAIT_TIME_NOT_SET) {
-                        maximumWaitTimeS = DEFAULT_MAXIMUM_WAIT_TIME_SEC;
-                    }
-                    request.setExpireIn(TimeUnit.SECONDS.toMillis(maximumWaitTimeS));
 
-                    CancellationSignal signal = new CancellationSignal();
-                    mCancellationSignals.add(signal);
-                    mLocationManager.getCurrentLocation(request, signal,
+            if (!mLocationUpdateInProgress) {
+                LocationRequest request = LocationRequest.createFromDeprecatedProvider(
+                        FUSED_PROVIDER, 0, 0, true);
+                request.setExpireIn(TimeUnit.SECONDS.toMillis(maximumWaitTimeS));
+
+                try {
+                    mLocationManager.getCurrentLocation(request, null,
                             new HandlerExecutor(mLocationHandler), this::onLocationUpdate);
-                    mNumLocationUpdatesInProgress++;
+                } catch (IllegalArgumentException e) {
+                    Log.e(TAG, "Cannot get current location. e=" + e);
+                    callback.onLocationUpdate(null);
+                    return;
                 }
+                mLocationUpdateInProgress = true;
             }
-            if (mNumLocationUpdatesInProgress > 0) {
-                mCallbacks.add(callback);
-            } else {
-                callback.onLocationUpdate(null);
-            }
+            mCallbacks.add(callback);
         }
 
         private boolean hasPermission(String permission) {
+            // TODO: remove the check. This will always return true because cell broadcast service
+            // is running under the UID Process.NETWORK_STACK_UID, which is below 10000. It will be
+            // automatically granted with all runtime permissions.
             return mContext.checkPermission(permission, Process.myPid(), Process.myUid())
                     == PackageManager.PERMISSION_GRANTED;
         }
