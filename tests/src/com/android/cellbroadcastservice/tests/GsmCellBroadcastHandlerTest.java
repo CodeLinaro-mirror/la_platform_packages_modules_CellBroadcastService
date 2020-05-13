@@ -163,9 +163,8 @@ public class GsmCellBroadcastHandlerTest extends CellBroadcastServiceTestBase {
         replaceInstance(CellBroadcastHandler.class, "mResourcesCache",
                 mGsmCellBroadcastHandler, mMockedResourcesCache);
         putResources(com.android.cellbroadcastservice.R.integer.message_expiration_time, 86400000);
-        putResources(
-                com.android.cellbroadcastservice.R.array.config_defaultCellBroadcastReceiverPkgs,
-                new String[]{"fake.cellcbroadcast.pkg"});
+        putResources(com.android.cellbroadcastservice.R.array
+                .additional_cell_broadcast_receiver_packages, new String[]{});
         putResources(com.android.cellbroadcastservice.R.array.area_info_channels, new int[]{});
         putResources(
                 com.android.cellbroadcastservice.R.array.config_area_info_receiver_packages,
@@ -192,8 +191,8 @@ public class GsmCellBroadcastHandlerTest extends CellBroadcastServiceTestBase {
         consumer.accept(Mockito.mock(Location.class));
 
         ArgumentCaptor<Intent> intentCaptor = ArgumentCaptor.forClass(Intent.class);
-        verify(mMockedContext).sendOrderedBroadcast(intentCaptor.capture(), anyString(),
-                anyString(), any(), any(), anyInt(), any(), any());
+        verify(mMockedContext).sendOrderedBroadcast(intentCaptor.capture(), any(),
+                (Bundle) any(), any(), any(), anyInt(), any(), any());
         Intent intent = intentCaptor.getValue();
         assertEquals(Telephony.Sms.Intents.ACTION_SMS_EMERGENCY_CB_RECEIVED, intent.getAction());
         SmsCbMessage msg = intent.getParcelableExtra("message");
