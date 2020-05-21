@@ -21,23 +21,24 @@ import static android.Manifest.permission.ACCESS_FINE_LOCATION;
 
 import static com.android.cellbroadcastservice.CellBroadcastStatsLog.CELL_BROADCAST_MESSAGE_ERROR__TYPE__UNEXPECTED_CDMA_MESSAGE_TYPE_FROM_FWK;
 
-import android.Manifest;
 import android.annotation.NonNull;
 import android.annotation.Nullable;
 import android.app.Activity;
-import android.app.AppOpsManager;
 import android.content.BroadcastReceiver;
 import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
+import android.content.pm.ResolveInfo;
 import android.content.res.Resources;
 import android.database.Cursor;
 import android.location.Location;
 import android.location.LocationManager;
 import android.location.LocationRequest;
 import android.net.Uri;
+import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerExecutor;
 import android.os.Looper;
@@ -60,10 +61,12 @@ import android.util.Log;
 
 import com.android.internal.annotations.VisibleForTesting;
 
+import java.io.File;
 import java.io.FileDescriptor;
 import java.io.PrintWriter;
 import java.text.DateFormat;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -77,6 +80,18 @@ import java.util.stream.Stream;
  * completes and our result receiver is called.
  */
 public class CellBroadcastHandler extends WakeLockStateMachine {
+    private static final String TAG = "CellBroadcastHandler";
+
+    /**
+     * CellBroadcast apex name
+     */
+    private static final String CB_APEX_NAME = "com.android.cellbroadcast";
+
+    /**
+     * Path where CB apex is mounted (/apex/com.android.cellbroadcast)
+     */
+    private static final String CB_APEX_PATH = new File("/apex", CB_APEX_NAME).getAbsolutePath();
+
     private static final String EXTRA_MESSAGE = "message";
 
     /**
@@ -502,8 +517,6 @@ public class CellBroadcastHandler extends WakeLockStateMachine {
      */
     protected void broadcastMessage(@NonNull SmsCbMessage message, @Nullable Uri messageUri,
             int slotIndex) {
-        String receiverPermission;
-        String appOp;
         String msg;
         Intent intent;
         if (message.isEmergencyMessage()) {
@@ -513,8 +526,6 @@ public class CellBroadcastHandler extends WakeLockStateMachine {
             intent = new Intent(Telephony.Sms.Intents.ACTION_SMS_EMERGENCY_CB_RECEIVED);
             //Emergency alerts need to be delivered with high priority
             intent.addFlags(Intent.FLAG_RECEIVER_FOREGROUND);
-            receiverPermission = Manifest.permission.RECEIVE_EMERGENCY_BROADCAST;
-            appOp = AppOpsManager.OPSTR_RECEIVE_EMERGENCY_BROADCAST;
 
             intent.putExtra(EXTRA_MESSAGE, message);
             putPhoneIdAndSubIdExtra(mContext, intent, slotIndex);
@@ -523,28 +534,31 @@ public class CellBroadcastHandler extends WakeLockStateMachine {
                 // Send additional broadcast intent to the specified package. This is only for sl4a
                 // automation tests.
                 String[] testPkgs = mContext.getResources().getStringArray(
-                        R.array.config_testCellBroadcastReceiverPkgs);
+                        R.array.test_cell_broadcast_receiver_packages);
                 if (testPkgs != null) {
                     Intent additionalIntent = new Intent(intent);
                     for (String pkg : testPkgs) {
                         additionalIntent.setPackage(pkg);
                         mContext.createContextAsUser(UserHandle.ALL, 0).sendOrderedBroadcast(
-                                additionalIntent, receiverPermission, appOp, null,
-                                getHandler(), Activity.RESULT_OK, null, null);
+                                intent, null, (Bundle) null, null, getHandler(),
+                                Activity.RESULT_OK, null, null);
+
                     }
                 }
             }
 
-            String[] pkgs = mContext.getResources().getStringArray(
-                    R.array.config_defaultCellBroadcastReceiverPkgs);
+            List<String> pkgs = new ArrayList<>();
+            pkgs.add(getDefaultCBRPackageName(mContext, intent));
+            pkgs.addAll(Arrays.asList(mContext.getResources().getStringArray(
+                    R.array.additional_cell_broadcast_receiver_packages)));
             if (pkgs != null) {
-                mReceiverCount.addAndGet(pkgs.length);
+                mReceiverCount.addAndGet(pkgs.size());
                 for (String pkg : pkgs) {
                     // Explicitly send the intent to all the configured cell broadcast receivers.
                     intent.setPackage(pkg);
                     mContext.createContextAsUser(UserHandle.ALL, 0).sendOrderedBroadcast(
-                            intent, receiverPermission, appOp, mOrderedBroadcastReceiver,
-                            getHandler(), Activity.RESULT_OK, null, null);
+                            intent, null, (Bundle) null, mOrderedBroadcastReceiver, getHandler(),
+                            Activity.RESULT_OK, null, null);
                 }
             }
         } else {
@@ -566,6 +580,43 @@ public class CellBroadcastHandler extends WakeLockStateMachine {
             mContext.getContentResolver().update(CellBroadcasts.CONTENT_URI, cv,
                     CellBroadcasts._ID + "=?", new String[] {messageUri.getLastPathSegment()});
         }
+    }
+
+    /**
+     * Checks if the app's path starts with CB_APEX_PATH
+     */
+    private static boolean isAppInCBApex(ApplicationInfo appInfo) {
+        return appInfo.sourceDir.startsWith(CB_APEX_PATH);
+    }
+
+    /**
+     * Find the name of the default CBR package. The criteria is that it belongs to CB apex and
+     * handles the given intent.
+     */
+    static String getDefaultCBRPackageName(Context context, Intent intent) {
+        PackageManager packageManager = context.getPackageManager();
+        List<ResolveInfo> cbrPackages = packageManager.queryBroadcastReceivers(intent, 0);
+
+        // remove apps that don't live in the CellBroadcast apex
+        cbrPackages.removeIf(info ->
+                !isAppInCBApex(info.activityInfo.applicationInfo));
+
+        if (cbrPackages.isEmpty()) {
+            Log.e(TAG, "getCBRPackageNames: no package found");
+            return null;
+        }
+
+        if (cbrPackages.size() > 1) {
+            // multiple apps found, log an error but continue
+            Log.e(TAG, "Found > 1 APK in CB apex that can resolve " + intent.getAction() + ": "
+                    + cbrPackages.stream()
+                    .map(info -> info.activityInfo.applicationInfo.packageName)
+                    .collect(Collectors.joining(", ")));
+        }
+
+        // Assume the first ResolveInfo is the one we're looking for
+        ResolveInfo info = cbrPackages.get(0);
+        return info.activityInfo.applicationInfo.packageName;
     }
 
     /**
