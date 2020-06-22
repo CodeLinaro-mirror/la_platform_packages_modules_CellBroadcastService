@@ -82,6 +82,8 @@ import java.util.stream.Stream;
 public class CellBroadcastHandler extends WakeLockStateMachine {
     private static final String TAG = "CellBroadcastHandler";
 
+    private static final boolean VDBG = false;
+
     /**
      * CellBroadcast apex name
      */
@@ -263,13 +265,19 @@ public class CellBroadcastHandler extends WakeLockStateMachine {
             if (!isDuplicate((SmsCbMessage) message.obj)) {
                 handleBroadcastSms((SmsCbMessage) message.obj);
                 return true;
+            } else {
+                CellBroadcastStatsLog.write(CellBroadcastStatsLog.CB_MESSAGE_FILTERED,
+                        CellBroadcastStatsLog.CELL_BROADCAST_MESSAGE_FILTERED__TYPE__CDMA,
+                        CellBroadcastStatsLog.CELL_BROADCAST_MESSAGE_FILTERED__FILTER__DUPLICATE_MESSAGE);
             }
             return false;
         } else {
-            loge("handleSmsMessage got object of type: " + message.obj.getClass().getName());
+            final String errorMessage =
+                    "handleSmsMessage got object of type: " + message.obj.getClass().getName();
+            loge(errorMessage);
             CellBroadcastStatsLog.write(CellBroadcastStatsLog.CB_MESSAGE_ERROR,
                     CELL_BROADCAST_MESSAGE_ERROR__TYPE__UNEXPECTED_CDMA_MESSAGE_TYPE_FROM_FWK,
-                    message.obj.getClass().getName());
+                    errorMessage);
             return false;
         }
     }
@@ -326,6 +334,59 @@ public class CellBroadcastHandler extends WakeLockStateMachine {
     }
 
     /**
+     * Check the location based on geographical scope defined in 3GPP TS 23.041 section 9.4.1.2.1.
+     *
+     * The Geographical Scope (GS) indicates the geographical area over which the Message Code
+     * is unique, and the display mode. The CBS message is not necessarily broadcast by all cells
+     * within the geographical area. When two CBS messages are received with identical Serial
+     * Numbers/Message Identifiers in two different cells, the Geographical Scope may be used to
+     * determine if the CBS messages are indeed identical.
+     *
+     * @param message The current message
+     * @param messageToCheck The older message in the database to be checked
+     * @return {@code true} if within the same area, otherwise {@code false}, which should be
+     * be considered as a new message.
+     */
+    private boolean isSameLocation(SmsCbMessage message,
+            SmsCbMessage messageToCheck) {
+        if (message.getGeographicalScope() != messageToCheck.getGeographicalScope()) {
+            return false;
+        }
+
+        // only cell wide (which means that if a message is displayed it is desirable that the
+        // message is removed from the screen when the UE selects the next cell and if any CBS
+        // message is received in the next cell it is to be regarded as "new").
+        if (message.getGeographicalScope() == SmsCbMessage.GEOGRAPHICAL_SCOPE_CELL_WIDE_IMMEDIATE
+                || message.getGeographicalScope() == SmsCbMessage.GEOGRAPHICAL_SCOPE_CELL_WIDE) {
+            return message.getLocation().isInLocationArea(messageToCheck.getLocation());
+        }
+
+        // Service Area wide (which means that a CBS message with the same Message Code and Update
+        // Number may or may not be "new" in the next cell according to whether the next cell is
+        // in the same Service Area as the current cell)
+        if (message.getGeographicalScope() == SmsCbMessage.GEOGRAPHICAL_SCOPE_LOCATION_AREA_WIDE) {
+            if (!message.getLocation().getPlmn().equals(messageToCheck.getLocation().getPlmn())) {
+                return false;
+            }
+
+            return message.getLocation().getLac() != -1
+                    && message.getLocation().getLac() == messageToCheck.getLocation().getLac();
+        }
+
+        // PLMN wide (which means that the Message Code and/or Update Number must change in the
+        // next cell, of the PLMN, for the CBS message to be "new". The CBS message is only relevant
+        // to the PLMN in which it is broadcast, so any change of PLMN (including a change to
+        // another PLMN which is an ePLMN) means the CBS message is "new")
+        if (message.getGeographicalScope() == SmsCbMessage.GEOGRAPHICAL_SCOPE_PLMN_WIDE) {
+            return !TextUtils.isEmpty(message.getLocation().getPlmn())
+                    && message.getLocation().getPlmn().equals(
+                            messageToCheck.getLocation().getPlmn());
+        }
+
+        return false;
+    }
+
+    /**
      * Check if the message is a duplicate
      *
      * @param message Cell broadcast message
@@ -371,20 +432,22 @@ public class CellBroadcastHandler extends WakeLockStateMachine {
         }
 
         boolean compareMessageBody = res.getBoolean(R.bool.duplicate_compare_body);
-        boolean compareCellLocation = res.getBoolean(R.bool.duplicate_compare_cell_location);
 
         log("Found " + cbMessages.size() + " messages since "
                 + DateFormat.getDateTimeInstance().format(dupCheckTime));
         for (SmsCbMessage messageToCheck : cbMessages) {
             // If messages are from different slots, then we only compare the message body.
+            if (VDBG) log("Checking the message " + messageToCheck);
             if (message.getSlotIndex() != messageToCheck.getSlotIndex()) {
                 if (TextUtils.equals(message.getMessageBody(), messageToCheck.getMessageBody())) {
                     log("Duplicate message detected from different slot. " + message);
                     return true;
                 }
+                if (VDBG) log("Not from a same slot.");
             } else {
                 // Check serial number if message is from the same carrier.
                 if (message.getSerialNumber() != messageToCheck.getSerialNumber()) {
+                    if (VDBG) log("Serial number does not match.");
                     // Not a dup. Check next one.
                     continue;
                 }
@@ -393,6 +456,7 @@ public class CellBroadcastHandler extends WakeLockStateMachine {
                 if (message.isEtwsMessage() && messageToCheck.isEtwsMessage()
                         && message.getEtwsWarningInfo().isPrimary()
                         != messageToCheck.getEtwsWarningInfo().isPrimary()) {
+                    if (VDBG) log("ETWS primary/secondary does not match.");
                     // Not a dup. Check next one.
                     continue;
                 }
@@ -406,13 +470,14 @@ public class CellBroadcastHandler extends WakeLockStateMachine {
                         && !Objects.equals(mServiceCategoryCrossRATMap.get(
                                 messageToCheck.getServiceCategory()),
                         message.getServiceCategory())) {
+                    if (VDBG) log("GSM/CDMA category does not match.");
                     // Not a dup. Check next one.
                     continue;
                 }
 
-                // For some carriers, comparing cell location is required.
-                if (compareCellLocation && (!message.getLocation().equals(
-                        messageToCheck.getLocation()))) {
+                // Check if the message location is different
+                if (!isSameLocation(message, messageToCheck)) {
+                    if (VDBG) log("Location does not match.");
                     // Not a dup. Check next one.
                     continue;
                 }
@@ -422,6 +487,8 @@ public class CellBroadcastHandler extends WakeLockStateMachine {
                         message.getMessageBody(), messageToCheck.getMessageBody())) {
                     log("Duplicate message detected. " + message);
                     return true;
+                } else {
+                    if (VDBG) log("Body does not match.");
                 }
             }
         }
@@ -464,6 +531,15 @@ public class CellBroadcastHandler extends WakeLockStateMachine {
         if (DBG) {
             logd("Device location is outside the broadcast area "
                     + CbGeoUtils.encodeGeometriesToString(broadcastArea));
+        }
+        if (message.getMessageFormat() == SmsCbMessage.MESSAGE_FORMAT_3GPP) {
+            CellBroadcastStatsLog.write(CellBroadcastStatsLog.CB_MESSAGE_FILTERED,
+                    CellBroadcastStatsLog.CELL_BROADCAST_MESSAGE_FILTERED__TYPE__GSM,
+                    CellBroadcastStatsLog.CELL_BROADCAST_MESSAGE_FILTERED__FILTER__GEOFENCED_MESSAGE);
+        } else if (message.getMessageFormat() == SmsCbMessage.MESSAGE_FORMAT_3GPP2) {
+            CellBroadcastStatsLog.write(CellBroadcastStatsLog.CB_MESSAGE_FILTERED,
+                    CellBroadcastStatsLog.CELL_BROADCAST_MESSAGE_FILTERED__TYPE__CDMA,
+                    CellBroadcastStatsLog.CELL_BROADCAST_MESSAGE_FILTERED__FILTER__GEOFENCED_MESSAGE);
         }
 
         sendMessage(EVENT_BROADCAST_NOT_REQUIRED);
