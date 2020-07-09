@@ -39,6 +39,7 @@ import android.location.LocationManager;
 import android.location.LocationRequest;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.CancellationSignal;
 import android.os.Handler;
 import android.os.HandlerExecutor;
 import android.os.Looper;
@@ -81,6 +82,8 @@ import java.util.stream.Stream;
  */
 public class CellBroadcastHandler extends WakeLockStateMachine {
     private static final String TAG = "CellBroadcastHandler";
+
+    private static final boolean VDBG = false;
 
     /**
      * CellBroadcast apex name
@@ -263,13 +266,19 @@ public class CellBroadcastHandler extends WakeLockStateMachine {
             if (!isDuplicate((SmsCbMessage) message.obj)) {
                 handleBroadcastSms((SmsCbMessage) message.obj);
                 return true;
+            } else {
+                CellBroadcastStatsLog.write(CellBroadcastStatsLog.CB_MESSAGE_FILTERED,
+                        CellBroadcastStatsLog.CELL_BROADCAST_MESSAGE_FILTERED__TYPE__CDMA,
+                        CellBroadcastStatsLog.CELL_BROADCAST_MESSAGE_FILTERED__FILTER__DUPLICATE_MESSAGE);
             }
             return false;
         } else {
-            loge("handleSmsMessage got object of type: " + message.obj.getClass().getName());
+            final String errorMessage =
+                    "handleSmsMessage got object of type: " + message.obj.getClass().getName();
+            loge(errorMessage);
             CellBroadcastStatsLog.write(CellBroadcastStatsLog.CB_MESSAGE_ERROR,
                     CELL_BROADCAST_MESSAGE_ERROR__TYPE__UNEXPECTED_CDMA_MESSAGE_TYPE_FROM_FWK,
-                    message.obj.getClass().getName());
+                    errorMessage);
             return false;
         }
     }
@@ -302,9 +311,11 @@ public class CellBroadcastHandler extends WakeLockStateMachine {
         Uri uri = mContext.getContentResolver().insert(CellBroadcasts.CONTENT_URI, cv);
 
         if (message.needGeoFencingCheck()) {
+            int maximumWaitingTime = getMaxLocationWaitingTime(message);
             if (DBG) {
-                log("Request location update for geo-fencing. serialNumber = "
-                        + message.getSerialNumber());
+                log("Requesting location for geo-fencing. serialNumber = "
+                        + message.getSerialNumber() + ", maximumWaitingTime = "
+                        + maximumWaitingTime);
             }
 
             requestLocationUpdate(location -> {
@@ -314,7 +325,7 @@ public class CellBroadcastHandler extends WakeLockStateMachine {
                 } else {
                     performGeoFencing(message, uri, message.getGeometries(), location, slotIndex);
                 }
-            }, getMaxLocationWaitingTime(message));
+            }, maximumWaitingTime);
         } else {
             if (DBG) {
                 log("Broadcast the message directly because no geo-fencing required, "
@@ -429,14 +440,17 @@ public class CellBroadcastHandler extends WakeLockStateMachine {
                 + DateFormat.getDateTimeInstance().format(dupCheckTime));
         for (SmsCbMessage messageToCheck : cbMessages) {
             // If messages are from different slots, then we only compare the message body.
+            if (VDBG) log("Checking the message " + messageToCheck);
             if (message.getSlotIndex() != messageToCheck.getSlotIndex()) {
                 if (TextUtils.equals(message.getMessageBody(), messageToCheck.getMessageBody())) {
                     log("Duplicate message detected from different slot. " + message);
                     return true;
                 }
+                if (VDBG) log("Not from a same slot.");
             } else {
                 // Check serial number if message is from the same carrier.
                 if (message.getSerialNumber() != messageToCheck.getSerialNumber()) {
+                    if (VDBG) log("Serial number does not match.");
                     // Not a dup. Check next one.
                     continue;
                 }
@@ -445,6 +459,7 @@ public class CellBroadcastHandler extends WakeLockStateMachine {
                 if (message.isEtwsMessage() && messageToCheck.isEtwsMessage()
                         && message.getEtwsWarningInfo().isPrimary()
                         != messageToCheck.getEtwsWarningInfo().isPrimary()) {
+                    if (VDBG) log("ETWS primary/secondary does not match.");
                     // Not a dup. Check next one.
                     continue;
                 }
@@ -458,12 +473,14 @@ public class CellBroadcastHandler extends WakeLockStateMachine {
                         && !Objects.equals(mServiceCategoryCrossRATMap.get(
                                 messageToCheck.getServiceCategory()),
                         message.getServiceCategory())) {
+                    if (VDBG) log("GSM/CDMA category does not match.");
                     // Not a dup. Check next one.
                     continue;
                 }
 
                 // Check if the message location is different
                 if (!isSameLocation(message, messageToCheck)) {
+                    if (VDBG) log("Location does not match.");
                     // Not a dup. Check next one.
                     continue;
                 }
@@ -473,6 +490,8 @@ public class CellBroadcastHandler extends WakeLockStateMachine {
                         message.getMessageBody(), messageToCheck.getMessageBody())) {
                     log("Duplicate message detected. " + message);
                     return true;
+                } else {
+                    if (VDBG) log("Body does not match.");
                 }
             }
         }
@@ -515,6 +534,15 @@ public class CellBroadcastHandler extends WakeLockStateMachine {
         if (DBG) {
             logd("Device location is outside the broadcast area "
                     + CbGeoUtils.encodeGeometriesToString(broadcastArea));
+        }
+        if (message.getMessageFormat() == SmsCbMessage.MESSAGE_FORMAT_3GPP) {
+            CellBroadcastStatsLog.write(CellBroadcastStatsLog.CB_MESSAGE_FILTERED,
+                    CellBroadcastStatsLog.CELL_BROADCAST_MESSAGE_FILTERED__TYPE__GSM,
+                    CellBroadcastStatsLog.CELL_BROADCAST_MESSAGE_FILTERED__FILTER__GEOFENCED_MESSAGE);
+        } else if (message.getMessageFormat() == SmsCbMessage.MESSAGE_FORMAT_3GPP2) {
+            CellBroadcastStatsLog.write(CellBroadcastStatsLog.CB_MESSAGE_FILTERED,
+                    CellBroadcastStatsLog.CELL_BROADCAST_MESSAGE_FILTERED__TYPE__CDMA,
+                    CellBroadcastStatsLog.CELL_BROADCAST_MESSAGE_FILTERED__FILTER__GEOFENCED_MESSAGE);
         }
 
         sendMessage(EVENT_BROADCAST_NOT_REQUIRED);
@@ -725,6 +753,8 @@ public class CellBroadcastHandler extends WakeLockStateMachine {
         private final Handler mLocationHandler;
 
         private boolean mLocationUpdateInProgress;
+        private final Runnable mTimeoutCallback;
+        private CancellationSignal mCancellationSignal;
 
         LocationRequester(Context context, LocationManager locationManager, Handler handler) {
             mLocationManager = locationManager;
@@ -732,6 +762,7 @@ public class CellBroadcastHandler extends WakeLockStateMachine {
             mContext = context;
             mLocationHandler = handler;
             mLocationUpdateInProgress = false;
+            mTimeoutCallback = this::onLocationTimeout;
         }
 
         /**
@@ -748,8 +779,17 @@ public class CellBroadcastHandler extends WakeLockStateMachine {
             mLocationHandler.post(() -> requestLocationUpdateInternal(callback, maximumWaitTimeS));
         }
 
+        private void onLocationTimeout() {
+            Log.e(TAG, "Location request timeout");
+            if (mCancellationSignal != null) {
+                mCancellationSignal.cancel();
+            }
+            onLocationUpdate(null);
+        }
+
         private void onLocationUpdate(@Nullable Location location) {
             mLocationUpdateInProgress = false;
+            mLocationHandler.removeCallbacks(mTimeoutCallback);
             LatLng latLng = null;
             if (location != null) {
                 Log.d(TAG, "Got location update");
@@ -788,8 +828,15 @@ public class CellBroadcastHandler extends WakeLockStateMachine {
                     Log.d(TAG, "Location request=" + request);
                 }
                 try {
-                    mLocationManager.getCurrentLocation(request, null,
+                    mCancellationSignal = new CancellationSignal();
+                    mLocationManager.getCurrentLocation(request, mCancellationSignal,
                             new HandlerExecutor(mLocationHandler), this::onLocationUpdate);
+                    // TODO: Remove the following workaround in S. We need to enforce the timeout
+                    // before location manager adds the support for timeout value which is less
+                    // than 30 seconds. After that we can rely on location manager's timeout
+                    // mechanism.
+                    mLocationHandler.postDelayed(mTimeoutCallback,
+                            TimeUnit.SECONDS.toMillis(maximumWaitTimeS));
                 } catch (IllegalArgumentException e) {
                     Log.e(TAG, "Cannot get current location. e=" + e);
                     callback.onLocationUpdate(null);
